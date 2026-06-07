@@ -3,7 +3,6 @@ import datetime
 import json
 import numpy as _np
 import pandas as pd
-from bs4 import BeautifulSoup
 
 from yfinance import utils
 from yfinance.config import YfConfig
@@ -18,6 +17,41 @@ info_retired_keys_price.update({"averageDailyVolume10Day", "averageVolume10days"
 info_retired_keys_exchange = {"currency", "exchange", "exchangeTimezoneName", "exchangeTimezoneShortName", "quoteType"}
 info_retired_keys_marketCap = {"marketCap"}
 info_retired_keys_symbol = {"symbol"}
+
+# Valuation-measure timeseries keys (fundamentals-timeseries API) -> display labels,
+# matching the rows historically shown on the Yahoo key-statistics page.
+_VALUATION_MEASURE_LABELS = {
+    "MarketCap": "Market Cap",
+    "EnterpriseValue": "Enterprise Value",
+    "PeRatio": "Trailing P/E",
+    "ForwardPeRatio": "Forward P/E",
+    "PegRatio": "PEG Ratio (5yr expected)",
+    "PsRatio": "Price/Sales",
+    "PbRatio": "Price/Book",
+    "EnterprisesValueRevenueRatio": "Enterprise Value/Revenue",
+    "EnterprisesValueEBITDARatio": "Enterprise Value/EBITDA",
+}
+# Measures displayed with a magnitude suffix (e.g. "3.76T") rather than 2 d.p.
+_VALUATION_LARGE_NUMBER_LABELS = {"Market Cap", "Enterprise Value"}
+
+
+def _format_valuation_value(value, large_number):
+    """Format a numeric valuation measure as the key-statistics page displayed it:
+    large numbers as e.g. '3.76T', everything else to 2 decimal places. Missing
+    values become '--' (exactly as the page renders them), which also keeps every
+    column string-typed (no NaN/float mixing)."""
+    if value is None:
+        return "--"
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if large_number:
+        magnitude = abs(value)
+        for suffix, threshold in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("k", 1e3)):
+            if magnitude >= threshold:
+                return f"{value / threshold:.2f}{suffix}"
+    return f"{value:.2f}"
 info_retired_keys = info_retired_keys_price | info_retired_keys_exchange | info_retired_keys_marketCap | info_retired_keys_symbol
 
 
@@ -670,37 +704,87 @@ class Quote:
         self._info = {k: _format(k, v) for k, v in query1_info.items()}
 
     def _fetch_valuation_measures(self):
-        url = f"https://finance.yahoo.com/quote/{self._symbol}/key-statistics"
+        # Valuation measures come from the fundamentals-timeseries API (the same
+        # source as the income/balance-sheet/cash-flow statements) instead of
+        # scraping the key-statistics web page, which was fragile (it returned an
+        # empty table whenever Yahoo changed the page layout). The returned shape
+        # is kept identical to the previous scrape: measures as the index, a
+        # 'Current' column plus period-end date columns (newest first), and
+        # display-formatted string values (e.g. '3.76T', '32.39').
+        keys = list(_VALUATION_MEASURE_LABELS.keys())
+        types = ",".join(f"{freq}{k}" for k in keys for freq in ("quarterly", "trailing"))
+        period1 = int(datetime.datetime(2016, 12, 31).timestamp())
+        period2 = int(pd.Timestamp.now("UTC").ceil("D").timestamp())
+        url = f"{_BASE_URL_}/ws/fundamentals-timeseries/v1/finance/timeseries/{self._symbol}"
+        params = {"symbol": self._symbol, "type": types, "period1": period1, "period2": period2}
         try:
-            response = self._data.cache_get(url=url)
+            # cache_get (not get_raw_json) to match scrapers/fundamentals.py and
+            # benefit from response caching for the same timeseries endpoint.
+            response = self._data.cache_get(url, params=params)
+            data = json.loads(response.text)
         except Exception as e:
             if not YfConfig.debug.hide_exceptions:
                 raise
-            utils.get_yf_logger().error(f"Failed to fetch key-statistics page: {e}")
+            utils.get_yf_logger().error(f"Failed to fetch valuation measures: {e}")
             self._valuation_measures = pd.DataFrame()
             return
 
         try:
-            soup = BeautifulSoup(response.text, "html.parser")
-            table = soup.find("table")
-            if table is None:
+            result = (data.get("timeseries") or {}).get("result") or []
+            quarterly = {}   # label -> {Timestamp: raw value}
+            trailing = {}    # label -> {Timestamp: raw value}
+            for item in result:
+                for type_name, points in item.items():
+                    if type_name in ("meta", "timestamp") or not isinstance(points, list):
+                        continue
+                    if type_name.startswith("trailing"):
+                        base, target = type_name[len("trailing"):], trailing
+                    elif type_name.startswith("quarterly"):
+                        base, target = type_name[len("quarterly"):], quarterly
+                    else:
+                        continue
+                    label = _VALUATION_MEASURE_LABELS.get(base)
+                    if label is None:
+                        continue
+                    for point in points:
+                        if not point:
+                            continue
+                        as_of = point.get("asOfDate")
+                        value = (point.get("reportedValue") or {}).get("raw")
+                        if as_of is not None and value is not None:
+                            ts = pd.Timestamp(as_of).normalize()
+                            target.setdefault(label, {})[ts] = value
+            if not quarterly and not trailing:
                 self._valuation_measures = pd.DataFrame()
                 return
 
-            headers = [th.get_text(strip=True) for th in table.find("tr").find_all(["th", "td"])]
-            rows = []
-            for tr in table.find_all("tr")[1:]:
-                cells = [td.get_text(strip=True) for td in tr.find_all(["th", "td"])]
-                rows.append(cells)
+            # 'Current' column = each measure's most recent trailing value.
+            current = {label: series[max(series)] for label, series in trailing.items() if series}
 
-            df = pd.DataFrame(rows, columns=headers)
-            df = df.set_index(df.columns[0])
+            # Most recent 5 quarters, matching the legacy key-statistics table.
+            dates = sorted({d for series in quarterly.values() for d in series}, reverse=True)[:5]
+            date_cols = [f"{d.month}/{d.day}/{d.year}" for d in dates]
+            # Emit every measure as a row, even those with no data — the
+            # key-statistics page always lists all measures and shows '--' for
+            # the ones it has no value for, so dropping them would lose rows the
+            # scrape kept (e.g. PEG Ratio / EV-EBITDA for BRK-B).
+            rows = {}
+            for label in _VALUATION_MEASURE_LABELS.values():
+                large = label in _VALUATION_LARGE_NUMBER_LABELS
+                row = {"Current": _format_valuation_value(current.get(label), large)}
+                series = quarterly.get(label, {})
+                for d, col in zip(dates, date_cols):
+                    row[col] = _format_valuation_value(series.get(d), large)
+                rows[label] = row
+            df = pd.DataFrame.from_dict(rows, orient="index")
+            df = df.reindex(list(_VALUATION_MEASURE_LABELS.values()))
+            df = df[["Current"] + date_cols]
             df.index.name = None
             self._valuation_measures = df
         except Exception as e:
             if not YfConfig.debug.hide_exceptions:
                 raise
-            utils.get_yf_logger().error(f"Failed to parse key-statistics page: {e}")
+            utils.get_yf_logger().error(f"Failed to parse valuation measures: {e}")
             self._valuation_measures = pd.DataFrame()
 
     def _fetch_complementary(self):

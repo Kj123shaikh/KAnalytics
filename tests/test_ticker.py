@@ -17,6 +17,7 @@ from tests.context import session_gbl
 from yfinance.exceptions import YFPricesMissingError, YFInvalidPeriodError, YFNotImplementedError, YFTickerMissingError, YFTzMissingError, YFDataException
 from yfinance.config import YfConfig
 
+import json
 import unittest
 # import requests_cache
 from unittest.mock import patch, MagicMock
@@ -1287,49 +1288,78 @@ class TestTickerFundsData(unittest.TestCase):
 
 class TestTickerValuationMeasures(unittest.TestCase):
 
-    _MOCK_HTML = """<html><body>
-    <table>
-        <tr><td></td><td>Current</td><td>12/31/2025</td><td>9/30/2025</td></tr>
-        <tr><td>Market Cap</td><td>3.76T</td><td>4.00T</td><td>3.76T</td></tr>
-        <tr><td>Enterprise Value</td><td>3.78T</td><td>4.04T</td><td>3.81T</td></tr>
-        <tr><td>Trailing P/E</td><td>32.39</td><td>36.44</td><td>38.64</td></tr>
-        <tr><td>Forward P/E</td><td>29.76</td><td>32.79</td><td>31.65</td></tr>
-        <tr><td>PEG Ratio (5yr expected)</td><td>2.27</td><td>2.75</td><td>2.44</td></tr>
-        <tr><td>Price/Sales</td><td>8.77</td><td>9.80</td><td>9.41</td></tr>
-        <tr><td>Price/Book</td><td>42.60</td><td>54.21</td><td>57.14</td></tr>
-        <tr><td>Enterprise Value/Revenue</td><td>8.68</td><td>9.71</td><td>9.32</td></tr>
-        <tr><td>Enterprise Value/EBITDA</td><td>24.73</td><td>27.92</td><td>26.87</td></tr>
-    </table>
-    </body></html>"""
+    # Valuation measures now come from the fundamentals-timeseries API instead
+    # of scraping the key-statistics HTML page, but the output shape/format is
+    # preserved: 'Current' + M/D/YYYY columns with display-string values.
+    # Note: 'timestamp' keys are present (as in the real API) and must be ignored;
+    # Trailing P/E intentionally lacks the 12/31/2025 quarter to exercise missing
+    # cells.
+    _MOCK_TS = {"timeseries": {"result": [
+        {"meta": {"type": ["quarterlyMarketCap"]}, "timestamp": [1758, 1767],
+         "quarterlyMarketCap": [
+             {"asOfDate": "2025-09-30", "reportedValue": {"raw": 3.76e12}},
+             {"asOfDate": "2025-12-31", "reportedValue": {"raw": 4.00e12}},
+         ]},
+        {"meta": {"type": ["trailingMarketCap"]}, "timestamp": [1780],
+         "trailingMarketCap": [
+             {"asOfDate": "2026-06-05", "reportedValue": {"raw": 4.514e12}},
+         ]},
+        {"meta": {"type": ["quarterlyPeRatio"]}, "timestamp": [1758],
+         "quarterlyPeRatio": [
+             {"asOfDate": "2025-09-30", "reportedValue": {"raw": 38.64}},
+         ]},
+        {"meta": {"type": ["trailingPeRatio"]}, "timestamp": [1780],
+         "trailingPeRatio": [
+             {"asOfDate": "2026-06-05", "reportedValue": {"raw": 37.21}},
+         ]},
+    ]}}
 
-    def _make_ticker_with_mock(self, html):
+    def _valuation_with_mock(self, payload):
         mock_response = MagicMock()
-        mock_response.text = html
+        mock_response.text = json.dumps(payload)
         with patch("yfinance.data.YfData.cache_get", return_value=mock_response):
-            dat = yf.Ticker("AAPL")
-            data = dat.valuation
-        return data
+            return yf.Ticker("AAPL").valuation
 
     def test_valuation_measures(self):
-        data = self._make_ticker_with_mock(self._MOCK_HTML)
-        self.assertEqual(data.shape, (9, 3), "unexpected shape")
+        data = self._valuation_with_mock(self._MOCK_TS)
+        # Shape/format preserved from the legacy scrape: 'Current' + newest-first
+        # M/D/YYYY columns, display-string values.
         self.assertListEqual(list(data.columns), ["Current", "12/31/2025", "9/30/2025"])
         self.assertIn("Market Cap", data.index)
         self.assertIn("Trailing P/E", data.index)
-        self.assertIn("Enterprise Value/EBITDA", data.index)
         self.assertIsNone(data.index.name)
-        self.assertEqual(data.loc["Market Cap", "Current"], "3.76T")
-        self.assertEqual(data.loc["Forward P/E", "12/31/2025"], "32.79")
+        self.assertEqual(data.loc["Market Cap", "Current"], "4.51T")
+        self.assertEqual(data.loc["Market Cap", "12/31/2025"], "4.00T")
+        self.assertEqual(data.loc["Market Cap", "9/30/2025"], "3.76T")
+        self.assertEqual(data.loc["Trailing P/E", "Current"], "37.21")
+        self.assertEqual(data.loc["Trailing P/E", "9/30/2025"], "38.64")
 
-    def test_valuation_measures_no_table(self):
-        data = self._make_ticker_with_mock("<html><body><p>No tables here</p></body></html>")
+    def test_valuation_measures_lists_all_measures(self):
+        # The key-statistics page always lists every measure (showing '--' for
+        # any with no data), so the API output must keep all 9 rows rather than
+        # dropping the empty ones. The mock supplies only Market Cap + Trailing
+        # P/E, so the other 7 measures are present and entirely '--'.
+        data = self._valuation_with_mock(self._MOCK_TS)
+        self.assertEqual(len(data.index), 9)
+        self.assertIn("PEG Ratio (5yr expected)", data.index)
+        self.assertIn("Enterprise Value/EBITDA", data.index)
+        self.assertTrue((data.loc["PEG Ratio (5yr expected)"] == "--").all())
+
+    def test_valuation_measures_missing_cell_is_dash(self):
+        # Trailing P/E lacks the 12/31/2025 quarter -> that cell is '--' (the
+        # string the page shows), keeping the column string-typed (no NaN mixing).
+        data = self._valuation_with_mock(self._MOCK_TS)
+        self.assertEqual(data.loc["Trailing P/E", "12/31/2025"], "--")
+        self.assertTrue(all(isinstance(v, str) for v in data["12/31/2025"]))
+
+    def test_valuation_measures_empty(self):
+        data = self._valuation_with_mock({"timeseries": {"result": []}})
         self.assertIsInstance(data, pd.DataFrame)
         self.assertTrue(data.empty)
 
     def test_valuation_measures_fetch_error(self):
         with patch("yfinance.data.YfData.cache_get", side_effect=Exception("network error")):
-            dat = yf.Ticker("AAPL")
-            data = dat.valuation
+            data = yf.Ticker("AAPL").valuation
         self.assertIsInstance(data, pd.DataFrame)
         self.assertTrue(data.empty)
 
