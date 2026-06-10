@@ -1357,6 +1357,27 @@ class TestTickerValuationMeasures(unittest.TestCase):
         self.assertIsInstance(data, pd.DataFrame)
         self.assertTrue(data.empty)
 
+    def test_valuation_measures_freq_yearly(self):
+        # freq='yearly' selects the annual* period columns; 'Current' still
+        # comes from the trailing series.
+        payload = {"timeseries": {"result": [
+            {"meta": {"type": ["annualMarketCap"]}, "timestamp": [1],
+             "annualMarketCap": [{"asOfDate": "2025-09-30", "reportedValue": {"raw": 3.76e12}}]},
+            {"meta": {"type": ["trailingMarketCap"]}, "timestamp": [2],
+             "trailingMarketCap": [{"asOfDate": "2026-06-05", "reportedValue": {"raw": 4.51e12}}]},
+        ]}}
+        mock_response = MagicMock()
+        mock_response.text = json.dumps(payload)
+        with patch("yfinance.data.YfData.cache_get", return_value=mock_response):
+            data = yf.Ticker("AAPL").get_valuation_measures(freq="yearly")
+        self.assertListEqual(list(data.columns), ["Current", "9/30/2025"])
+        self.assertEqual(data.loc["Market Cap", "Current"], "4.51T")
+        self.assertEqual(data.loc["Market Cap", "9/30/2025"], "3.76T")
+
+    def test_valuation_measures_invalid_freq(self):
+        with self.assertRaises(ValueError):
+            yf.Ticker("AAPL").get_valuation_measures(freq="bogus")
+
     def test_valuation_measures_fetch_error(self):
         with patch("yfinance.data.YfData.cache_get", side_effect=Exception("network error")):
             data = yf.Ticker("AAPL").valuation

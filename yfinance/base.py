@@ -287,9 +287,15 @@ class TickerBase:
             self._fast_info = FastInfo(self)
         return self._fast_info
 
-    def get_valuation_measures(self):
-        data = self._quote.valuation_measures
-        return data
+    def get_valuation_measures(self, freq="quarterly"):
+        """Valuation measures (market cap, P/E, P/S, P/B, EV/EBITDA, ...).
+
+        Args:
+            freq: period columns to return — "quarterly" (default), "monthly",
+                "yearly" or "trailing". The "Current" column always reflects the
+                latest trailing value.
+        """
+        return self._quote.get_valuation_measures(freq)
 
     def get_sustainability(self, as_dict=False):
         data = self._quote.sustainability

@@ -33,6 +33,9 @@ _VALUATION_MEASURE_LABELS = {
 }
 # Measures displayed with a magnitude suffix (e.g. "3.76T") rather than 2 d.p.
 _VALUATION_LARGE_NUMBER_LABELS = {"Market Cap", "Enterprise Value"}
+# Public freq -> fundamentals-timeseries type prefix for the period columns.
+_VALUATION_FREQ_PREFIX = {"quarterly": "quarterly", "monthly": "monthly",
+                          "yearly": "annual", "trailing": "trailing"}
 
 
 def _format_valuation_value(value, large_number):
@@ -527,7 +530,7 @@ class Quote:
         self._upgrades_downgrades = None
         self._calendar = None
         self._sec_filings = None
-        self._valuation_measures = None
+        self._valuation_measures = {}  # keyed by freq
 
         self._already_scraped = False
         self._already_fetched = False
@@ -610,9 +613,12 @@ class Quote:
 
     @property
     def valuation_measures(self) -> pd.DataFrame:
-        if self._valuation_measures is None:
-            self._fetch_valuation_measures()
-        return self._valuation_measures
+        return self.get_valuation_measures()
+
+    def get_valuation_measures(self, freq="quarterly") -> pd.DataFrame:
+        if freq not in self._valuation_measures:
+            self._valuation_measures[freq] = self._fetch_valuation_measures(freq)
+        return self._valuation_measures[freq]
 
     @staticmethod
     def valid_modules():
@@ -703,16 +709,23 @@ class Quote:
 
         self._info = {k: _format(k, v) for k, v in query1_info.items()}
 
-    def _fetch_valuation_measures(self):
+    def _fetch_valuation_measures(self, freq="quarterly"):
         # Valuation measures come from the fundamentals-timeseries API (the same
         # source as the income/balance-sheet/cash-flow statements) instead of
         # scraping the key-statistics web page, which was fragile (it returned an
         # empty table whenever Yahoo changed the page layout). The returned shape
         # is kept identical to the previous scrape: measures as the index, a
         # 'Current' column plus period-end date columns (newest first), and
-        # display-formatted string values (e.g. '3.76T', '32.39').
+        # display-formatted string values (e.g. '3.76T', '32.39'). ``freq``
+        # ('quarterly' / 'monthly' / 'yearly' / 'trailing') selects the period
+        # columns; 'Current' always comes from the trailing series.
+        prefix = _VALUATION_FREQ_PREFIX.get(freq)
+        if prefix is None:
+            raise ValueError(f"freq must be one of {list(_VALUATION_FREQ_PREFIX)}, not '{freq}'")
         keys = list(_VALUATION_MEASURE_LABELS.keys())
-        types = ",".join(f"{freq}{k}" for k in keys for freq in ("quarterly", "trailing"))
+        # Always also fetch the 'trailing' series for the 'Current' column.
+        prefixes = sorted({prefix, "trailing"})
+        types = ",".join(f"{p}{k}" for k in keys for p in prefixes)
         period1 = int(datetime.datetime(2016, 12, 31).timestamp())
         period2 = int(pd.Timestamp.now("UTC").ceil("D").timestamp())
         url = f"{_BASE_URL_}/ws/fundamentals-timeseries/v1/finance/timeseries/{self._symbol}"
@@ -726,21 +739,20 @@ class Quote:
             if not YfConfig.debug.hide_exceptions:
                 raise
             utils.get_yf_logger().error(f"Failed to fetch valuation measures: {e}")
-            self._valuation_measures = pd.DataFrame()
-            return
+            return pd.DataFrame()
 
         try:
             result = (data.get("timeseries") or {}).get("result") or []
-            quarterly = {}   # label -> {Timestamp: raw value}
+            period = {}      # label -> {Timestamp: raw value}  (the requested freq)
             trailing = {}    # label -> {Timestamp: raw value}
             for item in result:
                 for type_name, points in item.items():
                     if type_name in ("meta", "timestamp") or not isinstance(points, list):
                         continue
-                    if type_name.startswith("trailing"):
+                    if prefix != "trailing" and type_name.startswith(prefix):
+                        base, target = type_name[len(prefix):], period
+                    elif type_name.startswith("trailing"):
                         base, target = type_name[len("trailing"):], trailing
-                    elif type_name.startswith("quarterly"):
-                        base, target = type_name[len("quarterly"):], quarterly
                     else:
                         continue
                     label = _VALUATION_MEASURE_LABELS.get(base)
@@ -754,15 +766,16 @@ class Quote:
                         if as_of is not None and value is not None:
                             ts = pd.Timestamp(as_of).normalize()
                             target.setdefault(label, {})[ts] = value
-            if not quarterly and not trailing:
-                self._valuation_measures = pd.DataFrame()
-                return
+            if prefix == "trailing":
+                period = trailing
+            if not period and not trailing:
+                return pd.DataFrame()
 
             # 'Current' column = each measure's most recent trailing value.
             current = {label: series[max(series)] for label, series in trailing.items() if series}
 
-            # Most recent 5 quarters, matching the legacy key-statistics table.
-            dates = sorted({d for series in quarterly.values() for d in series}, reverse=True)[:5]
+            # Every period the API returns, newest first (no artificial cap).
+            dates = sorted({d for series in period.values() for d in series}, reverse=True)
             date_cols = [f"{d.month}/{d.day}/{d.year}" for d in dates]
             # Emit every measure as a row, even those with no data — the
             # key-statistics page always lists all measures and shows '--' for
@@ -772,7 +785,7 @@ class Quote:
             for label in _VALUATION_MEASURE_LABELS.values():
                 large = label in _VALUATION_LARGE_NUMBER_LABELS
                 row = {"Current": _format_valuation_value(current.get(label), large)}
-                series = quarterly.get(label, {})
+                series = period.get(label, {})
                 for d, col in zip(dates, date_cols):
                     row[col] = _format_valuation_value(series.get(d), large)
                 rows[label] = row
@@ -780,12 +793,12 @@ class Quote:
             df = df.reindex(list(_VALUATION_MEASURE_LABELS.values()))
             df = df[["Current"] + date_cols]
             df.index.name = None
-            self._valuation_measures = df
+            return df
         except Exception as e:
             if not YfConfig.debug.hide_exceptions:
                 raise
             utils.get_yf_logger().error(f"Failed to parse valuation measures: {e}")
-            self._valuation_measures = pd.DataFrame()
+            return pd.DataFrame()
 
     def _fetch_complementary(self):
         if self._already_fetched_complementary:
