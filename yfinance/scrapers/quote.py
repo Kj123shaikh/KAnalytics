@@ -1,6 +1,7 @@
 from yfinance._http import HTTPError
 import datetime
 import json
+import numbers
 import numpy as _np
 import pandas as pd
 
@@ -596,10 +597,50 @@ class Quote:
     def valuation_measures(self) -> pd.DataFrame:
         return self.get_valuation_measures()
 
-    def get_valuation_measures(self, freq="quarterly") -> pd.DataFrame:
+    def get_valuation_measures(self, freq="quarterly", periods=5) -> pd.DataFrame:
+        """Valuation measures (market cap, P/E, P/S, P/B, EV/EBITDA, ...).
+
+        Returns a DataFrame with the 9 valuation measures as rows and a
+        ``Current`` column plus period-end date columns (newest first). Values
+        are raw numeric measures (floats, with ``NaN`` for missing cells); the
+        date column labels remain ``"M/D/YYYY"`` strings.
+
+        Args:
+            freq: period columns to return — "quarterly" (default), "monthly",
+                "yearly" or "trailing". The "Current" column always reflects the
+                latest trailing value.
+            periods: cap on the number of period (date) columns returned, newest
+                first. Must be an int >= 0 or None. The default of 5 matches the
+                column count the old key-statistics page showed. ``periods=0``
+                returns only the "Current" column (a 9x1 DataFrame); ``None``
+                (or a value larger than the available history) returns every
+                available period column. The ``valuation`` property uses this
+                default — call the method form to control ``periods``.
+
+        Returns:
+            pd.DataFrame: valuation measures, ``Current`` first, sliced to at
+                most ``periods`` period columns.
+        """
+        # Validate `periods` before any fetch so a bad value never hits the network.
+        if periods is not None:
+            # Accept any integer (incl. numpy ints), but reject bool — it is an
+            # int subclass yet a bool column count is almost always a mistake.
+            if isinstance(periods, bool) or not isinstance(periods, numbers.Integral):
+                raise TypeError(f"periods must be an int >= 0 or None, not {type(periods).__name__}")
+            if periods < 0:
+                raise ValueError("periods must be >= 0 or None")
+
         if freq not in self._valuation_measures:
             self._valuation_measures[freq] = self._fetch_valuation_measures(freq)
-        return self._valuation_measures[freq]
+        df = self._valuation_measures[freq]
+
+        # The full df is cached per-freq; apply the `periods` cap by slicing on
+        # return so different `periods` values reuse the one cached fetch. Return
+        # a copy (the sliced path already does) so a caller can't mutate the cache.
+        if periods is None or df.empty:
+            return df.copy()
+        date_cols = [c for c in df.columns if c != "Current"]
+        return df[["Current"] + date_cols[:periods]]
 
     @staticmethod
     def valid_modules():
