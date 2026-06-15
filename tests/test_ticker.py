@@ -1289,8 +1289,9 @@ class TestTickerFundsData(unittest.TestCase):
 class TestTickerValuationMeasures(unittest.TestCase):
 
     # Valuation measures now come from the fundamentals-timeseries API instead
-    # of scraping the key-statistics HTML page, but the output shape/format is
-    # preserved: 'Current' + M/D/YYYY columns with display-string values.
+    # of scraping the key-statistics HTML page. The output shape is preserved
+    # ('Current' + M/D/YYYY columns), but values are now raw floats (NaN for
+    # missing cells) rather than display strings.
     # Note: 'timestamp' keys are present (as in the real API) and must be ignored;
     # Trailing P/E intentionally lacks the 12/31/2025 quarter to exercise missing
     # cells.
@@ -1322,35 +1323,35 @@ class TestTickerValuationMeasures(unittest.TestCase):
 
     def test_valuation_measures(self):
         data = self._valuation_with_mock(self._MOCK_TS)
-        # Shape/format preserved from the legacy scrape: 'Current' + newest-first
-        # M/D/YYYY columns, display-string values.
+        # Shape preserved from the legacy scrape: 'Current' + newest-first
+        # M/D/YYYY columns. Values are now raw floats (NaN for missing).
         self.assertListEqual(list(data.columns), ["Current", "12/31/2025", "9/30/2025"])
         self.assertIn("Market Cap", data.index)
         self.assertIn("Trailing P/E", data.index)
         self.assertIsNone(data.index.name)
-        self.assertEqual(data.loc["Market Cap", "Current"], "4.51T")
-        self.assertEqual(data.loc["Market Cap", "12/31/2025"], "4.00T")
-        self.assertEqual(data.loc["Market Cap", "9/30/2025"], "3.76T")
-        self.assertEqual(data.loc["Trailing P/E", "Current"], "37.21")
-        self.assertEqual(data.loc["Trailing P/E", "9/30/2025"], "38.64")
+        self.assertEqual(data.loc["Market Cap", "Current"], 4.514e12)
+        self.assertEqual(data.loc["Market Cap", "12/31/2025"], 4.00e12)
+        self.assertEqual(data.loc["Market Cap", "9/30/2025"], 3.76e12)
+        self.assertEqual(data.loc["Trailing P/E", "Current"], 37.21)
+        self.assertEqual(data.loc["Trailing P/E", "9/30/2025"], 38.64)
 
     def test_valuation_measures_lists_all_measures(self):
-        # The key-statistics page always lists every measure (showing '--' for
-        # any with no data), so the API output must keep all 9 rows rather than
-        # dropping the empty ones. The mock supplies only Market Cap + Trailing
-        # P/E, so the other 7 measures are present and entirely '--'.
+        # The key-statistics page always listed every measure, so the API output
+        # must keep all 9 rows rather than dropping the empty ones. The mock
+        # supplies only Market Cap + Trailing P/E, so the other 7 measures are
+        # present and entirely NaN.
         data = self._valuation_with_mock(self._MOCK_TS)
         self.assertEqual(len(data.index), 9)
         self.assertIn("PEG Ratio (5yr expected)", data.index)
         self.assertIn("Enterprise Value/EBITDA", data.index)
-        self.assertTrue((data.loc["PEG Ratio (5yr expected)"] == "--").all())
+        self.assertTrue(data.loc["PEG Ratio (5yr expected)"].isna().all())
 
-    def test_valuation_measures_missing_cell_is_dash(self):
-        # Trailing P/E lacks the 12/31/2025 quarter -> that cell is '--' (the
-        # string the page shows), keeping the column string-typed (no NaN mixing).
+    def test_valuation_measures_missing_cell_is_nan(self):
+        # Trailing P/E lacks the 12/31/2025 quarter -> that cell is NaN, and the
+        # values are raw floats (float64 column, no display strings).
         data = self._valuation_with_mock(self._MOCK_TS)
-        self.assertEqual(data.loc["Trailing P/E", "12/31/2025"], "--")
-        self.assertTrue(all(isinstance(v, str) for v in data["12/31/2025"]))
+        self.assertTrue(pd.isna(data.loc["Trailing P/E", "12/31/2025"]))
+        self.assertEqual(data["12/31/2025"].dtype, "float64")
 
     def test_valuation_measures_empty(self):
         data = self._valuation_with_mock({"timeseries": {"result": []}})
@@ -1371,8 +1372,8 @@ class TestTickerValuationMeasures(unittest.TestCase):
         with patch("yfinance.data.YfData.cache_get", return_value=mock_response):
             data = yf.Ticker("AAPL").get_valuation_measures(freq="yearly")
         self.assertListEqual(list(data.columns), ["Current", "9/30/2025"])
-        self.assertEqual(data.loc["Market Cap", "Current"], "4.51T")
-        self.assertEqual(data.loc["Market Cap", "9/30/2025"], "3.76T")
+        self.assertEqual(data.loc["Market Cap", "Current"], 4.51e12)
+        self.assertEqual(data.loc["Market Cap", "9/30/2025"], 3.76e12)
 
     def test_valuation_measures_invalid_freq(self):
         with self.assertRaises(ValueError):
@@ -1383,6 +1384,7 @@ class TestTickerValuationMeasures(unittest.TestCase):
             data = yf.Ticker("AAPL").valuation
         self.assertIsInstance(data, pd.DataFrame)
         self.assertTrue(data.empty)
+
 
 def suite():
     suite = unittest.TestSuite()

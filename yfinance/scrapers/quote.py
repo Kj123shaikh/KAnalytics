@@ -31,30 +31,11 @@ _VALUATION_MEASURE_LABELS = {
     "EnterprisesValueRevenueRatio": "Enterprise Value/Revenue",
     "EnterprisesValueEBITDARatio": "Enterprise Value/EBITDA",
 }
-# Measures displayed with a magnitude suffix (e.g. "3.76T") rather than 2 d.p.
-_VALUATION_LARGE_NUMBER_LABELS = {"Market Cap", "Enterprise Value"}
 # Public freq -> fundamentals-timeseries type prefix for the period columns.
 _VALUATION_FREQ_PREFIX = {"quarterly": "quarterly", "monthly": "monthly",
                           "yearly": "annual", "trailing": "trailing"}
 
 
-def _format_valuation_value(value, large_number):
-    """Format a numeric valuation measure as the key-statistics page displayed it:
-    large numbers as e.g. '3.76T', everything else to 2 decimal places. Missing
-    values become '--' (exactly as the page renders them), which also keeps every
-    column string-typed (no NaN/float mixing)."""
-    if value is None:
-        return "--"
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return "--"
-    if large_number:
-        magnitude = abs(value)
-        for suffix, threshold in (("T", 1e12), ("B", 1e9), ("M", 1e6), ("k", 1e3)):
-            if magnitude >= threshold:
-                return f"{value / threshold:.2f}{suffix}"
-    return f"{value:.2f}"
 info_retired_keys = info_retired_keys_price | info_retired_keys_exchange | info_retired_keys_marketCap | info_retired_keys_symbol
 
 
@@ -714,9 +695,10 @@ class Quote:
         # source as the income/balance-sheet/cash-flow statements) instead of
         # scraping the key-statistics web page, which was fragile (it returned an
         # empty table whenever Yahoo changed the page layout). The returned shape
-        # is kept identical to the previous scrape: measures as the index, a
-        # 'Current' column plus period-end date columns (newest first), and
-        # display-formatted string values (e.g. '3.76T', '32.39'). ``freq``
+        # matches the previous scrape: measures as the index, a 'Current' column
+        # plus period-end date columns (newest first). Values are the raw numeric
+        # measures (floats, with NaN for missing cells) rather than the old
+        # display-formatted strings (e.g. '3.76T', '32.39'). ``freq``
         # ('quarterly' / 'monthly' / 'yearly' / 'trailing') selects the period
         # columns; 'Current' always comes from the trailing series.
         prefix = _VALUATION_FREQ_PREFIX.get(freq)
@@ -778,16 +760,16 @@ class Quote:
             dates = sorted({d for series in period.values() for d in series}, reverse=True)
             date_cols = [f"{d.month}/{d.day}/{d.year}" for d in dates]
             # Emit every measure as a row, even those with no data — the
-            # key-statistics page always lists all measures and shows '--' for
-            # the ones it has no value for, so dropping them would lose rows the
-            # scrape kept (e.g. PEG Ratio / EV-EBITDA for BRK-B).
+            # key-statistics page always listed all measures, so dropping them
+            # would lose rows the scrape kept (e.g. PEG Ratio / EV-EBITDA for
+            # BRK-B). Missing cells become NaN (the parse only stored non-None
+            # floats, so .get(..., nan) yields the raw value or NaN).
             rows = {}
             for label in _VALUATION_MEASURE_LABELS.values():
-                large = label in _VALUATION_LARGE_NUMBER_LABELS
-                row = {"Current": _format_valuation_value(current.get(label), large)}
+                row = {"Current": current.get(label, _np.nan)}
                 series = period.get(label, {})
                 for d, col in zip(dates, date_cols):
-                    row[col] = _format_valuation_value(series.get(d), large)
+                    row[col] = series.get(d, _np.nan)
                 rows[label] = row
             df = pd.DataFrame.from_dict(rows, orient="index")
             df = df.reindex(list(_VALUATION_MEASURE_LABELS.values()))
